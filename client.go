@@ -19,22 +19,19 @@ type Client struct {
 	Cache    *Cache
 	Expire   time.Duration
 
-	localCache       map[string]interface{}
-	localCacheLock   sync.RWMutex
-	inTransaction    bool
-	setQueue         map[string]interface{}
-	deleteQueue      map[string]bool
-	deleteCacheQueue map[string]bool
+	localCache     map[string]interface{}
+	localCacheLock sync.RWMutex
 }
 
 // NewClient creates a dscache Client. This should be created for every request while
 // you can have a global datastore Client and cache pool.
 func NewClient(ctx context.Context, dsClient *datastore.Client, cache *Cache) (*Client, error) {
 	c := &Client{
-		Context:  ctx,
-		DSClient: dsClient,
-		Cache:    cache,
-		Expire:   time.Hour * 24,
+		Context:    ctx,
+		DSClient:   dsClient,
+		Cache:      cache,
+		Expire:     time.Hour * 24,
+		localCache: make(map[string]interface{}),
 	}
 	return c, nil
 }
@@ -58,6 +55,8 @@ func (c *Client) putCache(key *datastore.Key, src interface{}) error {
 	return nil
 }
 
+// todo transaction
+
 // Run runs the given query in the given context.
 func (c *Client) Run(ctx context.Context, q *datastore.Query) *datastore.Iterator {
 	return c.DSClient.Run(ctx, q)
@@ -72,6 +71,7 @@ func (c *Client) Put(ctx context.Context, key *datastore.Key, src interface{}) (
 	}
 
 	if err := c.putCache(key, src); err != nil {
+		// todo make sure it's a success
 		log.Printf(err.Error())
 	}
 
@@ -92,7 +92,7 @@ func (c *Client) PutMulti(ctx context.Context, keys []*datastore.Key, src interf
 		valMap[cacheKey(key)] = val
 	}
 	if err := c.Cache.SetMulti(valMap, c.Expire); err != nil {
-		// ignore this error
+		// todo make sure it's a success
 		log.Printf("dscache.Client.PutMulti: failed to cache %v", err)
 	}
 	return keys, nil
@@ -120,11 +120,10 @@ func (c *Client) Get(ctx context.Context, key *datastore.Key, dst interface{}) e
 
 	// Check redis cache
 	if !found {
-		if err := c.Cache.Get(cKey, dst); err != nil {
-			return fmt.Errorf("dscache.Client.Get: failed cache get %v", err)
+		if err := c.Cache.Get(cKey, dst); err == nil {
+			c.putLocalCache(key, dst)
+			found = true
 		}
-		c.putLocalCache(key, dst)
-		found = true
 	}
 
 	// get from datastore
@@ -133,6 +132,7 @@ func (c *Client) Get(ctx context.Context, key *datastore.Key, dst interface{}) e
 			return fmt.Errorf("dscache.Client.Get: failed datastore get %v", err)
 		}
 		if err := c.putCache(key, dst); err != nil {
+			// todo can i ignore this?
 			log.Printf(err.Error())
 		}
 	}
@@ -224,6 +224,13 @@ func (c *Client) GetMulti(ctx context.Context, keys []*datastore.Key, dst interf
 			}
 		}
 
+		if len(toCache) > 0 {
+			if err := c.Cache.SetMulti(toCache, c.Expire); err != nil {
+				// todo handle failed to cache
+				log.Printf(err.Error())
+			}
+		}
+
 		if len(keyErrs) > 0 {
 			merr := make(datastore.MultiError, len(keys))
 			for idx, key := range keys {
@@ -288,6 +295,19 @@ func (c *Client) DeleteMulti(ctx context.Context, keys []*datastore.Key) error {
 	}
 
 	return nil
+}
+
+// FlushLocal removes all local cache
+func (c *Client) FlushLocal() {
+	c.localCacheLock.Lock()
+	defer c.localCacheLock.Unlock()
+	c.localCache = make(map[string]interface{})
+}
+
+// FlushAll removes all cache
+func (c *Client) FlushAll() error {
+	c.FlushLocal()
+	return c.Cache.Flush()
 }
 
 func cacheKey(k *datastore.Key) string {

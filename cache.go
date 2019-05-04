@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/gob"
 	"fmt"
+	"os"
 	"reflect"
 	"time"
 
@@ -11,8 +12,6 @@ import (
 )
 
 var (
-	// ErrNotFound when cache is not found
-	ErrNotFound        = fmt.Errorf("cache not found")
 	cacheVersionPrefix = "dsc1:"
 )
 
@@ -43,7 +42,10 @@ func (m MultiError) Count() int {
 // NewCache creates a cache for dscache
 func NewCache(server string) *Cache {
 	if server == "" {
-		server = ":6379"
+		server = os.Getenv("REDIS_HOST")
+		if server == "" {
+			server = ":6379"
+		}
 	}
 	return &Cache{
 		Pool: &redis.Pool{
@@ -135,7 +137,7 @@ func (c *Cache) GetMulti(keys []string, values interface{}) error {
 				err = gob.NewDecoder(bytes.NewBuffer(val)).Decode(out[key])
 			}
 		} else {
-			err = ErrNotFound
+			err = redis.ErrNil
 		}
 
 		if err != nil {
@@ -275,4 +277,13 @@ func (c *Cache) GetKeys(pattern string) ([]string, error) {
 	}
 
 	return keys, nil
+}
+
+// Flush removes everything from cache
+func (c *Cache) Flush() error {
+
+	conn := c.Pool.Get()
+	defer conn.Close()
+	_, err := conn.Do("FLUSHALL")
+	return err
 }
