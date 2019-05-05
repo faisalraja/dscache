@@ -1,10 +1,13 @@
 package dscache
 
 import (
+	"bytes"
 	"context"
+	"encoding/gob"
 	"fmt"
 	"log"
 	"reflect"
+	"strings"
 	"sync"
 	"time"
 
@@ -61,10 +64,10 @@ func (c *Client) putMultiCache(items map[string]interface{}) error {
 	go func() {
 		if len(items) == 1 {
 			for k, v := range items {
-				errc <- c.Cache.Set(k, v, c.Expire)
+				errc <- c.Cache.Set(k, marshal(v), c.Expire)
 			}
 		} else {
-			errc <- c.Cache.SetMulti(items, c.Expire)
+			errc <- c.Cache.SetMulti(marshalMap(items), c.Expire)
 		}
 	}()
 	c.putMultiLocalCache(items)
@@ -194,12 +197,9 @@ func (c *Client) PutMulti(ctx context.Context, keys []*datastore.Key, src interf
 
 // Get checks local cache, then memcache, then datastore. Caches it if it's not in cache yet.
 func (c *Client) Get(ctx context.Context, key *datastore.Key, dst interface{}) error {
-	elem := reflect.ValueOf(dst)
-	if elem.Kind() != reflect.Ptr {
+	v := reflect.ValueOf(dst)
+	if v.Kind() != reflect.Ptr {
 		return fmt.Errorf("dscache.Client.Get: dst must be a pointer")
-	}
-	if !elem.CanSet() {
-		elem = elem.Elem()
 	}
 	found := false
 	cKey := cacheKey(key)
@@ -207,14 +207,15 @@ func (c *Client) Get(ctx context.Context, key *datastore.Key, dst interface{}) e
 	// Check local cache first
 	c.localCacheLock.RLock()
 	if val, ok := c.localCache[cKey]; ok {
-		elem.Set(reflect.Indirect(reflect.ValueOf(val)))
+		setValue(key, v, val)
 		found = true
 	}
 	c.localCacheLock.RUnlock()
 
 	// Check redis cache
 	if !found {
-		if err := c.Cache.Get(cKey, dst); err == nil {
+		if buf, err := c.Cache.Get(cKey); err == nil {
+			setValue(key, v, buf)
 			c.putLocalCache(cKey, dst)
 			found = true
 		}
@@ -247,61 +248,69 @@ func (c *Client) GetMulti(ctx context.Context, keys []*datastore.Key, dst interf
 	}
 
 	var (
-		findInCacheKeys []*datastore.Key
-		findInDSKeys    []*datastore.Key
-		cKeys           []string
+		cKeys       []string
+		findInCache []int
+		findInDS    []int
+		dsKeys      []*datastore.Key
 	)
-	kLen := len(keys)
-	findInCacheVals := reflect.MakeSlice(vals.Type(), 0, kLen)
-	findInDSVals := reflect.MakeSlice(vals.Type(), 0, kLen)
 	toCache := make(map[string]interface{})
 	keyErrs := make(map[*datastore.Key]error)
 
 	// check local cache first
 	c.localCacheLock.RLock()
-	for idx, key := range keys {
-		elem := vals.Index(idx)
-		if v, ok := c.localCache[cacheKey(keys[idx])]; ok {
-			vOf := reflect.ValueOf(v)
-			if elem.Kind() == reflect.Ptr {
-				elem.Set(vOf)
-			} else {
-				elem.Set(reflect.Indirect(vOf))
-			}
+	for i := range keys {
+		elem := vals.Index(i)
+		cKey := cacheKey(keys[i])
+		if v, ok := c.localCache[cKey]; ok {
+			setValue(keys[i], elem, v)
 		} else {
-			if elem.Kind() == reflect.Ptr && elem.IsNil() {
-				elem.Set(reflect.New(elem.Type().Elem()))
-			}
-			findInCacheKeys = append(findInCacheKeys, key)
-			findInCacheVals = reflect.Append(findInCacheVals, elem)
-			cKeys = append(cKeys, cacheKey(key))
+			findInCache = append(findInCache, i)
+			cKeys = append(cKeys, cKey)
 		}
 	}
 	c.localCacheLock.RUnlock()
 
 	// check redis cache
-	if len(findInCacheKeys) > 0 {
-		if err := c.Cache.GetMulti(cKeys, findInCacheVals.Interface()); err != nil {
+	if len(findInCache) > 0 {
+		if bMap, err := c.Cache.GetMulti(cKeys...); err != nil {
 			// some are found or all failed
 			if merr, ok := err.(MultiError); ok {
-				for idx, key := range findInCacheKeys {
-					val := findInCacheVals.Index(idx)
-					if merr[idx] == nil {
-						toCache[cacheKey(key)] = val
+				for _, i := range findInCache {
+					var serr error
+					key := keys[i]
+					cKey := cacheKey(key)
+					val := vals.Index(i)
+					if merr.Key(cKey) == nil {
+						serr := setValue(key, val, bMap[cKey])
+						if serr == nil {
+							toCache[cKey] = val.Interface()
+						}
 					} else {
-						findInDSKeys = append(findInDSKeys, key)
-						findInDSVals = reflect.Append(findInDSVals, val)
+						serr = merr
+					}
+
+					if serr != nil {
+						dsKeys = append(dsKeys, key)
+						findInDS = append(findInDS, i)
 					}
 				}
 			} else {
 				// failed to get from cache
-				findInDSKeys = findInCacheKeys
-				findInDSVals = findInCacheVals
+				findInDS = findInCache
+				for _, i := range findInCache {
+					dsKeys = append(dsKeys, keys[i])
+				}
 			}
 		} else {
 			// all found
-			for idx, key := range findInCacheKeys {
-				toCache[cacheKey(key)] = findInCacheVals.Index(idx).Interface()
+			for _, i := range findInCache {
+				key := keys[i]
+				cKey := cacheKey(key)
+				val := vals.Index(i)
+				serr := setValue(key, val, bMap[cKey])
+				if serr == nil {
+					toCache[cKey] = val.Interface()
+				}
 			}
 		}
 
@@ -312,25 +321,33 @@ func (c *Client) GetMulti(ctx context.Context, keys []*datastore.Key, dst interf
 	}
 
 	// find in datastore
-	if len(findInDSKeys) > 0 {
+	if len(findInDS) > 0 {
+		dsVals := reflect.MakeSlice(reflect.TypeOf(dst), len(dsKeys), len(dsKeys))
+		for k, i := range findInDS {
+			dsVals.Index(k).Set(vals.Index(i))
+		}
 		cKeys = make([]string, 0)
-		if err := c.DSClient.GetMulti(ctx, findInDSKeys, findInDSVals.Interface()); err != nil {
+		if err := c.DSClient.GetMulti(ctx, dsKeys, dsVals.Interface()); err != nil {
 			if merr, ok := err.(datastore.MultiError); ok {
-				for idx, key := range findInDSKeys {
-					keyErrs[key] = merr[idx]
-					if merr[idx] == nil || merr[idx] == datastore.ErrNoSuchEntity {
+				for i, key := range dsKeys {
+					keyErrs[key] = merr[i]
+					if merr[i] == nil {
 						cKey := cacheKey(key)
 						cKeys = append(cKeys, cKey)
-						toCache[cKey] = findInDSVals.Index(idx).Interface()
+						toCache[cKey] = dsVals.Index(i).Interface()
 					}
 				}
 			}
 		} else {
-			for idx, key := range findInDSKeys {
+			for i, key := range dsKeys {
 				cKey := cacheKey(key)
 				cKeys = append(cKeys, cKey)
-				toCache[cKey] = findInDSVals.Index(idx).Interface()
+				toCache[cKey] = dsVals.Index(i).Interface()
 			}
+		}
+		// re-assign results to dst
+		for k, i := range findInDS {
+			vals.Index(i).Set(dsVals.Index(k))
 		}
 
 		if len(toCache) > 0 {
@@ -344,26 +361,24 @@ func (c *Client) GetMulti(ctx context.Context, keys []*datastore.Key, dst interf
 	}
 
 	if len(keyErrs) > 0 {
+		realErrs := 0
+		merr := make(datastore.MultiError, len(keys))
+		for i, key := range keys {
+			err := keyErrs[key]
+			// we consider no such entity as not error
+			if err == datastore.ErrNoSuchEntity {
+				merr[i] = nil
+			} else {
+				merr[i] = err
 
-		// nil dst with errs?
-		for idx, key := range keys {
-			if err, ok := keyErrs[key]; ok && err != nil {
-				elem := vals.Index(idx)
-				if elem.Kind() == reflect.Ptr && !elem.IsNil() {
-					elem.Set(reflect.Zero(elem.Type()))
+				if err != nil {
+					realErrs++
 				}
 			}
 		}
-
-		merr := make(datastore.MultiError, len(keys))
-		for idx, key := range keys {
-			if err, ok := keyErrs[key]; ok {
-				merr[idx] = err
-			} else {
-				merr[idx] = nil
-			}
+		if realErrs > 0 {
+			return merr
 		}
-		return merr
 	}
 
 	return nil
@@ -428,4 +443,84 @@ func (c *Client) FlushAll() error {
 
 func cacheKey(k *datastore.Key) string {
 	return fmt.Sprintf("%s%s", cacheVersionPrefix, k.Encode())
+}
+
+func loadKey(key *datastore.Key, v reflect.Value) {
+	if v.Kind() == reflect.Ptr {
+		v = v.Elem()
+	}
+	t := v.Type()
+
+	// find datastore:"__key__"
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		tag := f.Tag.Get("datastore")
+		if strings.Contains(tag, "__key__") {
+			fv := v.FieldByName(f.Name)
+			if fv.Kind() == reflect.Ptr {
+				fv.Set(reflect.ValueOf(key))
+			}
+			break
+		}
+	}
+}
+
+func marshal(d interface{}) []byte {
+	buf := bytes.Buffer{}
+	if err := gob.NewEncoder(&buf).Encode(d); err != nil {
+		log.Fatalf("dscache.marshal: error %v", err)
+		return nil
+	}
+	return buf.Bytes()
+}
+
+func marshalMap(m map[string]interface{}) map[string][]byte {
+	o := make(map[string][]byte, len(m))
+	for k, v := range m {
+		o[k] = marshal(v)
+	}
+	return o
+}
+
+func unmarshal(data []byte, dst interface{}) error {
+	return gob.NewDecoder(bytes.NewBuffer(data)).Decode(dst)
+}
+
+func setValue(key *datastore.Key, val reflect.Value, d interface{}) error {
+
+	if val.Kind() == reflect.Ptr && val.IsNil() {
+		val.Set(reflect.New(val.Type().Elem()))
+	}
+
+	if buf, ok := d.([]byte); ok {
+		if err := unmarshal(buf, val.Interface()); err != nil {
+			return err
+		}
+	} else {
+		if !val.CanSet() {
+			val = val.Elem()
+		}
+		vv := reflect.ValueOf(d)
+		if vv.Type() == val.Type() {
+			val.Set(vv)
+		} else if vv.Kind() != reflect.Ptr {
+			var vt reflect.Value
+			if vv.CanAddr() {
+				vt = vv.Addr()
+			} else {
+				vt = reflect.New(vv.Type()).Elem()
+				vt.Set(vv)
+				vt = vt.Addr()
+			}
+			val.Set(vt)
+		} else {
+			val.Set(reflect.Indirect(vv))
+		}
+	}
+
+	if key != nil {
+		loadKey(key, val)
+	}
+
+	return nil
 }

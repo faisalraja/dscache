@@ -22,14 +22,14 @@ var testDSClient *datastore.Client
 
 type (
 	TestA struct {
-		Key    *datastore.Key `datastore:"__key__"`
-		Str    string         `datastore:"str"`
-		Int    int            `datastore:"int"`
-		Ignore string         `datastore:"-"`
-		Byte   []byte
-		Strs   []string
-		Bool   bool
-		Int64  int64
+		Key     *datastore.Key `datastore:"__key__"`
+		Str     string         `datastore:"str"`
+		Int     int            `datastore:"int"`
+		Nil     *string        `datastore:"noindex,omitempty"`
+		Strs    []string
+		Bool    bool
+		Int64   int64
+		Float64 float64
 	}
 
 	TestB struct {
@@ -64,12 +64,11 @@ func TestPutGet(t *testing.T) {
 	client := NewClient(ctx, testDSClient, testCache)
 
 	t1 := &TestA{
-		Str:    "hello",
-		Int:    1,
-		Int64:  100,
-		Ignore: "Yes",
-		Bool:   true,
-		Strs:   []string{"test a", "test b"},
+		Str:   "hello",
+		Int:   1,
+		Int64: 100,
+		Bool:  true,
+		Strs:  []string{"test a", "test b"},
 	}
 	k1 := datastore.IDKey("TestA", 0, nil)
 
@@ -78,36 +77,46 @@ func TestPutGet(t *testing.T) {
 		t.Errorf("Failed to put %v", err)
 	}
 	c1 := cacheKey(key)
-	if _, ok := client.localCache[c1]; !ok {
+	cv1, ok := client.localCache[c1]
+	loadKey(key, reflect.ValueOf(cv1))
+	if !ok {
 		t.Errorf("Failed to put to local cache")
 	}
-	if found, _ := client.Cache.Exists(c1); !found {
+	if !reflect.DeepEqual(cv1, t1) {
+		t.Errorf("Value does not match from local cache")
+	}
+	t2 := &TestA{}
+	if buf, err := client.Cache.Get(c1); err != nil {
 		t.Errorf("Failed to put to redis cache")
+	} else {
+		setValue(key, reflect.ValueOf(t2), buf)
+	}
+	if !reflect.DeepEqual(cv1, t2) {
+		t.Errorf("Value does not match from redis cache: %v != %v", cv1, t2)
 	}
 
-	t2 := &TestA{}
-	if err := client.Get(ctx, key, t2); err != nil {
+	localT := &TestA{}
+	if err := client.Get(ctx, key, localT); err != nil {
 		t.Errorf("Failed to get %v", err)
-	}
-	if !reflect.DeepEqual(t1, t2) {
-		t.Errorf("t1 and t2 not equal")
 	}
 	client.FlushLocal()
-	t2 = &TestA{}
-	if err := client.Get(ctx, key, t2); err != nil {
+
+	redisT := &TestA{}
+	if err := client.Get(ctx, key, redisT); err != nil {
 		t.Errorf("Failed to get %v", err)
-	}
-	if !reflect.DeepEqual(t1, t2) {
-		t.Errorf("t1 and t2 not equal")
 	}
 	client.FlushAll()
-	t2 = &TestA{}
-	if err := client.Get(ctx, key, t2); err != nil {
+
+	dsT := &TestA{}
+	if err := client.Get(ctx, key, dsT); err != nil {
 		t.Errorf("Failed to get %v", err)
 	}
-	// should not be equal since we don't load the Key here but still pass above
-	if reflect.DeepEqual(t1, t2) {
-		t.Errorf("t1 and t2 not equal")
+
+	if !reflect.DeepEqual(dsT, localT) {
+		t.Errorf("DS value not equal to local: %v != %v", dsT, localT)
+	}
+	if !reflect.DeepEqual(dsT, redisT) {
+		t.Errorf("DS value not equal to redis: %v != %v", dsT, redisT)
 	}
 }
 
@@ -116,12 +125,11 @@ func TestPutMultiGetMulti(t *testing.T) {
 	client := NewClient(ctx, testDSClient, testCache)
 
 	t1 := &TestA{
-		Str:    "hello",
-		Int:    1,
-		Int64:  100,
-		Ignore: "Yes",
-		Bool:   true,
-		Strs:   []string{"test a", "test b"},
+		Str:   "hello",
+		Int:   1,
+		Int64: 100,
+		Bool:  true,
+		Strs:  []string{"test a", "test b"},
 	}
 	k1 := datastore.IDKey("TestA", 0, nil)
 	k2 := datastore.NameKey("TestA", "bbb", nil)
@@ -137,28 +145,27 @@ func TestPutMultiGetMulti(t *testing.T) {
 		t.Errorf("Failed to putmulti %v", err)
 	}
 	// client.FlushLocal()
-	// client.FlushAll()
+	client.FlushAll()
 	keys = append(keys, k4, k5)
 	out := make([]*TestA, 5)
-
 	if err := client.GetMulti(ctx, keys, out); err != nil {
 		if merr, ok := err.(datastore.MultiError); ok {
-			if merr[0] != nil {
-				t.Errorf("Failed error 0")
-			}
-			if merr[1] != nil {
-				t.Errorf("Failed error 1")
-			}
-			if merr[2] != nil {
-				t.Errorf("Failed error 2")
-			}
-			if merr[3] == nil {
-				t.Errorf("Failed error 3")
-			}
-			if merr[4] == nil {
-				t.Errorf("Failed error 4")
+			for i, v := range merr {
+				if i < 3 && v == nil {
+					t.Errorf("MultiError %v is nil", v)
+				} else if i >= 3 && v != nil {
+					t.Errorf("MultiError %v is not nil", v)
+				}
 			}
 
+		}
+	} else {
+		for i, v := range out {
+			if i < 3 && v == nil {
+				t.Errorf("Value %v is nil", v)
+			} else if i >= 3 && v != nil {
+				t.Errorf("Value %v is not nil", v)
+			}
 		}
 	}
 	client.FlushAll()
@@ -169,12 +176,11 @@ func TestRunQueryDeleteAll(t *testing.T) {
 	client := NewClient(ctx, testDSClient, testCache)
 
 	t1 := &TestA{
-		Str:    "hello",
-		Int:    1,
-		Int64:  100,
-		Ignore: "Yes",
-		Bool:   true,
-		Strs:   []string{"test a", "test b"},
+		Str:   "hello",
+		Int:   1,
+		Int64: 100,
+		Bool:  true,
+		Strs:  []string{"test a", "test b"},
 	}
 	k1 := datastore.IDKey("TestA", 0, nil)
 	k2 := datastore.IDKey("TestA", 0, nil)

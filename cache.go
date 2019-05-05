@@ -1,11 +1,8 @@
 package dscache
 
 import (
-	"bytes"
-	"encoding/gob"
 	"fmt"
 	"os"
-	"reflect"
 	"time"
 
 	"github.com/garyburd/redigo/redis"
@@ -22,10 +19,18 @@ type Cache struct {
 }
 
 // MultiError is returned for batch actions
-type MultiError []error
+type MultiError map[string]error
 
 func (m MultiError) Error() string {
 	return fmt.Sprintf("MultiError: %d", m.Count())
+}
+
+// Key returns error for specified key
+func (m MultiError) Key(k string) error {
+	if v, ok := m[k]; ok {
+		return v
+	}
+	return nil
 }
 
 // Count returns number of errors
@@ -87,88 +92,68 @@ func (c *Cache) Ping() error {
 }
 
 // Get an item from cache
-func (c *Cache) Get(key string, value interface{}) error {
+func (c *Cache) Get(key string) ([]byte, error) {
 
 	conn := c.Pool.Get()
 	defer conn.Close()
 
-	var data []byte
 	data, err := redis.Bytes(conn.Do("GET", key))
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("dscache.Cache.Get: failed %v", err)
 	}
-	return gob.NewDecoder(bytes.NewBuffer(data)).Decode(value)
+	return data, nil
 }
 
-// GetMulti get multiple items from cache
-func (c *Cache) GetMulti(keys []string, values interface{}) error {
-
+// GetMulti get multiple items from cache, returns a map of key: value in bytes.
+// It will always return the same length of map from keys give if it returns a multiError
+func (c *Cache) GetMulti(keys ...string) (map[string][]byte, error) {
 	conn := c.Pool.Get()
 	defer conn.Close()
+
 	var (
 		kArgs []interface{}
-		out   []interface{}
 		data  [][]byte
-		errs  MultiError
 	)
-	if reflect.TypeOf(values).Kind() != reflect.Slice {
-		return fmt.Errorf("dscache.Cache.GetMulti: values must be a slice")
-	}
-	vals := reflect.ValueOf(values)
-	if len(keys) != vals.Len() {
-		return fmt.Errorf("dscache.Cache.GetMulti: length of keys must be equal to length of values")
-	}
-	for k, key := range keys {
+	out := make(map[string][]byte)
+	mErr := make(MultiError)
+
+	for _, key := range keys {
 		kArgs = append(kArgs, key)
-		out = append(out, vals.Index(k).Interface())
 	}
 
 	data, err := redis.ByteSlices(conn.Do("MGET", kArgs...))
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("dscache.Cache.GetMulti: failed %v", err)
 	}
 
-	for key, val := range data {
-		var err error
-		if val != nil {
-			elem := reflect.ValueOf(out[key])
-			if elem.Kind() != reflect.Ptr {
-				err = fmt.Errorf("dscache.Cache.GetMulti: value of slice must be a pointer")
-			} else {
-				err = gob.NewDecoder(bytes.NewBuffer(val)).Decode(out[key])
-			}
+	for i, v := range data {
+		k := keys[i]
+		out[k] = v
+		if v == nil {
+			mErr[k] = redis.ErrNil
 		} else {
-			err = redis.ErrNil
+			mErr[k] = nil
 		}
+	}
 
-		if err != nil {
-			errs = append(errs, err)
-		} else {
-			errs = append(errs, nil)
-		}
+	if mErr.Count() > 0 {
+		return out, mErr
 	}
-	if errs.Count() > 0 {
-		return errs
-	}
-	return nil
+
+	return out, nil
 }
 
 // Set a single item in cache
-func (c *Cache) Set(key string, value interface{}, expire time.Duration) error {
+func (c *Cache) Set(key string, value []byte, expire time.Duration) error {
 
 	conn := c.Pool.Get()
 	defer conn.Close()
 
-	var buf bytes.Buffer
-	if err := gob.NewEncoder(&buf).Encode(value); err != nil {
-		return err
-	}
-
 	var err error
 	if expire >= time.Second {
-		_, err = conn.Do("SETEX", key, int(expire.Seconds()), buf.Bytes())
+		_, err = conn.Do("SETEX", key, int(expire.Seconds()), value)
 	} else {
-		_, err = conn.Do("SET", key, buf.Bytes())
+		_, err = conn.Do("SET", key, value)
 	}
 	if err != nil {
 		return err
@@ -178,7 +163,7 @@ func (c *Cache) Set(key string, value interface{}, expire time.Duration) error {
 }
 
 // SetMulti sets multiple items in cache
-func (c *Cache) SetMulti(items map[string]interface{}, expire time.Duration) error {
+func (c *Cache) SetMulti(items map[string][]byte, expire time.Duration) error {
 
 	conn := c.Pool.Get()
 	defer conn.Close()
@@ -186,17 +171,13 @@ func (c *Cache) SetMulti(items map[string]interface{}, expire time.Duration) err
 	var (
 		keys   []string
 		params []interface{}
-		errs   MultiError
+		mErr   MultiError
 	)
 
-	for key, item := range items {
+	for key, val := range items {
 		keys = append(keys, key)
-		var buf bytes.Buffer
-		if err := gob.NewEncoder(&buf).Encode(item); err != nil {
-			return err
-		}
 		params = append(params, key)
-		params = append(params, buf.Bytes())
+		params = append(params, val)
 	}
 
 	conn.Send("MSET", params...)
@@ -212,15 +193,15 @@ func (c *Cache) SetMulti(items map[string]interface{}, expire time.Duration) err
 	if expire >= time.Second {
 		for _, key := range keys {
 			if _, err := conn.Receive(); err != nil {
-				errs = append(errs, fmt.Errorf("dscache.Cache.SetMulti: EXPIRE %s Error %v", key, err))
+				mErr[key] = fmt.Errorf("dscache.Cache.SetMulti: EXPIRE %s Error %v", key, err)
 			} else {
-				errs = append(errs, nil)
+				mErr[key] = nil
 			}
 		}
 	}
 
-	if errs.Count() > 0 {
-		return errs
+	if mErr.Count() > 0 {
+		return mErr
 	}
 
 	return nil
