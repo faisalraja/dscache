@@ -2,7 +2,10 @@ package dscache
 
 import (
 	"context"
+	"os"
+	"os/signal"
 	"reflect"
+	"syscall"
 	"testing"
 
 	"cloud.google.com/go/datastore"
@@ -45,48 +48,20 @@ func init() {
 	} else {
 		testDSClient = client
 	}
+
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt)
+	signal.Notify(c, syscall.SIGTERM)
+	signal.Notify(c, syscall.SIGKILL)
+	go func() {
+		<-c
+		testCache.Pool.Close()
+	}()
 }
 
-func TestNewClient(t *testing.T) {
+func TestPutGet(t *testing.T) {
 	ctx := context.Background()
-
-	_, err := NewClient(ctx, testDSClient, testCache)
-	if err != nil {
-		t.Errorf("Failed to create dscache client: %v", err)
-	}
-}
-
-func TestPut(t *testing.T) {
-	ctx := context.Background()
-	client, _ := NewClient(ctx, testDSClient, testCache)
-
-	t1 := &TestA{}
-	k1 := datastore.IDKey("TestA", 0, nil)
-	key, err := client.Put(ctx, k1, t1)
-	if err != nil {
-		t.Errorf("Failed put: %v", err)
-	}
-
-	c1 := cacheKey(key)
-	if _, ok := client.localCache[c1]; !ok {
-		t.Errorf("Failed to put to local cache")
-	}
-
-	if found, _ := client.Cache.Exists(c1); !found {
-		t.Errorf("Failed to put to redis")
-	}
-
-	// when recreating a context local cache should be empty
-	ctx = context.Background()
-	client, _ = NewClient(ctx, testDSClient, testCache)
-	if _, ok := client.localCache[c1]; ok {
-		t.Errorf("Local cache should not exists from new ctx")
-	}
-}
-
-func TestGet(t *testing.T) {
-	ctx := context.Background()
-	client, _ := NewClient(ctx, testDSClient, testCache)
+	client := NewClient(ctx, testDSClient, testCache)
 
 	t1 := &TestA{
 		Str:    "hello",
@@ -97,7 +72,18 @@ func TestGet(t *testing.T) {
 		Strs:   []string{"test a", "test b"},
 	}
 	k1 := datastore.IDKey("TestA", 0, nil)
-	key, _ := client.Put(ctx, k1, t1)
+
+	key, err := client.Put(ctx, k1, t1)
+	if err != nil {
+		t.Errorf("Failed to put %v", err)
+	}
+	c1 := cacheKey(key)
+	if _, ok := client.localCache[c1]; !ok {
+		t.Errorf("Failed to put to local cache")
+	}
+	if found, _ := client.Cache.Exists(c1); !found {
+		t.Errorf("Failed to put to redis cache")
+	}
 
 	t2 := &TestA{}
 	if err := client.Get(ctx, key, t2); err != nil {
@@ -123,5 +109,58 @@ func TestGet(t *testing.T) {
 	if reflect.DeepEqual(t1, t2) {
 		t.Errorf("t1 and t2 not equal")
 	}
+}
 
+func TestPutMultiGetMulti(t *testing.T) {
+	ctx := context.Background()
+	client := NewClient(ctx, testDSClient, testCache)
+
+	t1 := &TestA{
+		Str:    "hello",
+		Int:    1,
+		Int64:  100,
+		Ignore: "Yes",
+		Bool:   true,
+		Strs:   []string{"test a", "test b"},
+	}
+	k1 := datastore.IDKey("TestA", 0, nil)
+	k2 := datastore.NameKey("TestA", "bbb", nil)
+	k3 := datastore.NameKey("TestA", "ccc", nil)
+	k3.Namespace = "InC"
+	k4 := datastore.NameKey("TestA", "ddd", nil)
+	k5 := datastore.NameKey("TestA", "eee", nil)
+
+	input := []*TestA{t1, t1, t1}
+
+	keys, err := client.PutMulti(ctx, []*datastore.Key{k1, k2, k3}, input)
+	if err != nil {
+		t.Errorf("Failed to putmulti %v", err)
+	}
+
+	keys = append(keys, k4, k5)
+	var out []*TestA
+	for range keys {
+		out = append(out, &TestA{})
+	}
+	if err := client.GetMulti(ctx, keys, out); err != nil {
+		if merr, ok := err.(datastore.MultiError); ok {
+			if merr[0] != nil {
+				t.Errorf("Failed error 0")
+			}
+			if merr[1] != nil {
+				t.Errorf("Failed error 1")
+			}
+			if merr[2] != nil {
+				t.Errorf("Failed error 2")
+			}
+			if merr[3] == nil {
+				t.Errorf("Failed error 3")
+			}
+			if merr[4] == nil {
+				t.Errorf("Failed error 4")
+			}
+
+		}
+	}
+	client.FlushAll()
 }
