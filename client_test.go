@@ -136,12 +136,11 @@ func TestPutMultiGetMulti(t *testing.T) {
 	if err != nil {
 		t.Errorf("Failed to putmulti %v", err)
 	}
-
+	// client.FlushLocal()
+	// client.FlushAll()
 	keys = append(keys, k4, k5)
-	var out []*TestA
-	for range keys {
-		out = append(out, &TestA{})
-	}
+	out := make([]*TestA, 5)
+
 	if err := client.GetMulti(ctx, keys, out); err != nil {
 		if merr, ok := err.(datastore.MultiError); ok {
 			if merr[0] != nil {
@@ -162,5 +161,52 @@ func TestPutMultiGetMulti(t *testing.T) {
 
 		}
 	}
+	client.FlushAll()
+}
+
+func TestRunQueryDeleteAll(t *testing.T) {
+	ctx := context.Background()
+	client := NewClient(ctx, testDSClient, testCache)
+
+	t1 := &TestA{
+		Str:    "hello",
+		Int:    1,
+		Int64:  100,
+		Ignore: "Yes",
+		Bool:   true,
+		Strs:   []string{"test a", "test b"},
+	}
+	k1 := datastore.IDKey("TestA", 0, nil)
+	k2 := datastore.IDKey("TestA", 0, nil)
+	k3 := datastore.IDKey("TestA", 0, nil)
+	k4 := datastore.IDKey("TestA", 0, nil)
+	k5 := datastore.IDKey("TestA", 0, nil)
+
+	input := []*TestA{t1, t1, t1, t1, t1}
+
+	_, err := client.PutMulti(ctx, []*datastore.Key{k1, k2, k3, k4, k5}, input)
+	if err != nil {
+		t.Errorf("Failed to putmulti %v", err)
+	}
+	out := make([]*TestA, 3)
+	q := datastore.NewQuery("TestA")
+	var cursor string
+	for {
+		keys, cursor, err := client.RunQuery(ctx, q, out, cursor)
+		if err != nil {
+			t.Errorf("Failed to run query %v", err)
+		}
+
+		if len(keys) > 0 {
+			if err := client.DeleteMulti(ctx, keys); err != nil {
+				t.Errorf("Failed to delete keys: %v", len(keys))
+			}
+		}
+
+		if cursor == "" {
+			break
+		}
+	}
+
 	client.FlushAll()
 }

@@ -131,8 +131,9 @@ func (c *Cache) GetMulti(keys []string, values interface{}) error {
 	for key, val := range data {
 		var err error
 		if val != nil {
-			if reflect.ValueOf(out[key]).Type().Kind() != reflect.Ptr {
-				err = fmt.Errorf("dscache.Cache.GetMulti: value must be of type pointer")
+			elem := reflect.ValueOf(out[key])
+			if elem.Kind() != reflect.Ptr {
+				err = fmt.Errorf("dscache.Cache.GetMulti: value of slice must be a pointer")
 			} else {
 				err = gob.NewDecoder(bytes.NewBuffer(val)).Decode(out[key])
 			}

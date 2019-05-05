@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"cloud.google.com/go/datastore"
+	"google.golang.org/api/iterator"
 )
 
 // Client can replace the regular go cloud datastore client on usage.
@@ -81,6 +82,75 @@ func (c *Client) Run(ctx context.Context, q *datastore.Query) *datastore.Iterato
 	return c.DSClient.Run(ctx, q)
 }
 
+// RunQuery will execute your query in keys only and store to dst results while returning
+// a cursor for the next page. The length of dst will also override the limit for your returned query.
+// If dst is nil, provide your own length by setting it in query like q.Limit(10)
+func (c *Client) RunQuery(ctx context.Context, q *datastore.Query, dst interface{}, cursor string) ([]*datastore.Key, string, error) {
+
+	var keys []*datastore.Key
+	var val reflect.Value
+	q = q.KeysOnly()
+	var limit int
+
+	if dst != nil {
+		val = reflect.ValueOf(dst)
+
+		if val.Kind() != reflect.Slice {
+			return keys, "", fmt.Errorf("dscache.Client.RunQuery: dst must be a slice of pointers")
+		}
+		limit = val.Len()
+		q = q.Limit(limit)
+	}
+
+	if cursor != "" {
+		c, err := datastore.DecodeCursor(cursor)
+		if err != nil {
+			return keys, "", fmt.Errorf("dscache.Client.RunQuery: invalid cursor %v", err)
+		}
+		q = q.Start(c)
+	}
+	t := c.DSClient.Run(ctx, q)
+
+	for {
+		if key, err := t.Next(nil); err == iterator.Done {
+			break
+		} else if err != nil {
+			return keys, "", fmt.Errorf("dscache.Client.RunQuery: iterator error %v", err)
+		} else {
+			keys = append(keys, key)
+		}
+	}
+
+	crsr, err := t.Cursor()
+	if err != nil {
+		return keys, "", fmt.Errorf("dscache.Client.RunQuery: cursor error %v", err)
+	}
+	kLen := len(keys)
+	if kLen > 0 && kLen <= limit {
+		cursor = crsr.String()
+	} else {
+		cursor = ""
+	}
+	if kLen > 0 && dst != nil {
+		var ns reflect.Value
+		if kLen < limit {
+			// create right size slice and let's just fill dst later
+			ns = reflect.MakeSlice(val.Type(), kLen, kLen)
+			dst = ns.Interface()
+			cursor = ""
+		}
+		if err := c.GetMulti(ctx, keys, dst); err != nil {
+			return keys, cursor, fmt.Errorf("dscache.Client.RunQuery: failed to populate dst %v", err)
+		}
+		if ns.Kind() == reflect.Slice {
+			for idx := range keys {
+				val.Index(idx).Set(ns.Index(idx))
+			}
+		}
+	}
+	return keys, cursor, nil
+}
+
 // Put saves entity into datastore, cache, context cache
 func (c *Client) Put(ctx context.Context, key *datastore.Key, src interface{}) (*datastore.Key, error) {
 	var err error
@@ -124,12 +194,12 @@ func (c *Client) PutMulti(ctx context.Context, keys []*datastore.Key, src interf
 
 // Get checks local cache, then memcache, then datastore. Caches it if it's not in cache yet.
 func (c *Client) Get(ctx context.Context, key *datastore.Key, dst interface{}) error {
-	set := reflect.ValueOf(dst)
-	if set.Kind() != reflect.Ptr {
+	elem := reflect.ValueOf(dst)
+	if elem.Kind() != reflect.Ptr {
 		return fmt.Errorf("dscache.Client.Get: dst must be a pointer")
 	}
-	if !set.CanSet() {
-		set = set.Elem()
+	if !elem.CanSet() {
+		elem = elem.Elem()
 	}
 	found := false
 	cKey := cacheKey(key)
@@ -137,7 +207,7 @@ func (c *Client) Get(ctx context.Context, key *datastore.Key, dst interface{}) e
 	// Check local cache first
 	c.localCacheLock.RLock()
 	if val, ok := c.localCache[cKey]; ok {
-		set.Set(reflect.Indirect(reflect.ValueOf(val)))
+		elem.Set(reflect.Indirect(reflect.ValueOf(val)))
 		found = true
 	}
 	c.localCacheLock.RUnlock()
@@ -164,6 +234,7 @@ func (c *Client) Get(ctx context.Context, key *datastore.Key, dst interface{}) e
 }
 
 // GetMulti is batch version of Get
+// todo support []T since cache.GetMulti doesn't
 func (c *Client) GetMulti(ctx context.Context, keys []*datastore.Key, dst interface{}) error {
 	vals := reflect.ValueOf(dst)
 
@@ -177,29 +248,32 @@ func (c *Client) GetMulti(ctx context.Context, keys []*datastore.Key, dst interf
 
 	var (
 		findInCacheKeys []*datastore.Key
-		findInCacheVals []interface{}
 		findInDSKeys    []*datastore.Key
-		findInDSVals    []interface{}
 		cKeys           []string
 	)
+	kLen := len(keys)
+	findInCacheVals := reflect.MakeSlice(vals.Type(), 0, kLen)
+	findInDSVals := reflect.MakeSlice(vals.Type(), 0, kLen)
 	toCache := make(map[string]interface{})
+	keyErrs := make(map[*datastore.Key]error)
 
 	// check local cache first
 	c.localCacheLock.RLock()
 	for idx, key := range keys {
-		val := vals.Index(idx).Interface()
-		set := reflect.ValueOf(val)
-		if set.Kind() != reflect.Ptr {
-			return fmt.Errorf("dscache.Client.GetMulti: dst value is not a slice %v", val)
-		}
+		elem := vals.Index(idx)
 		if v, ok := c.localCache[cacheKey(keys[idx])]; ok {
-			if !set.CanSet() {
-				set = set.Elem()
+			vOf := reflect.ValueOf(v)
+			if elem.Kind() == reflect.Ptr {
+				elem.Set(vOf)
+			} else {
+				elem.Set(reflect.Indirect(vOf))
 			}
-			set.Set(reflect.Indirect(reflect.ValueOf(v)))
 		} else {
+			if elem.Kind() == reflect.Ptr && elem.IsNil() {
+				elem.Set(reflect.New(elem.Type().Elem()))
+			}
 			findInCacheKeys = append(findInCacheKeys, key)
-			findInCacheVals = append(findInCacheVals, val)
+			findInCacheVals = reflect.Append(findInCacheVals, elem)
 			cKeys = append(cKeys, cacheKey(key))
 		}
 	}
@@ -207,16 +281,16 @@ func (c *Client) GetMulti(ctx context.Context, keys []*datastore.Key, dst interf
 
 	// check redis cache
 	if len(findInCacheKeys) > 0 {
-		if err := c.Cache.GetMulti(cKeys, findInCacheVals); err != nil {
+		if err := c.Cache.GetMulti(cKeys, findInCacheVals.Interface()); err != nil {
 			// some are found or all failed
 			if merr, ok := err.(MultiError); ok {
 				for idx, key := range findInCacheKeys {
-					val := findInCacheVals[idx]
+					val := findInCacheVals.Index(idx)
 					if merr[idx] == nil {
 						toCache[cacheKey(key)] = val
 					} else {
 						findInDSKeys = append(findInDSKeys, key)
-						findInDSVals = append(findInDSVals, val)
+						findInDSVals = reflect.Append(findInDSVals, val)
 					}
 				}
 			} else {
@@ -227,7 +301,7 @@ func (c *Client) GetMulti(ctx context.Context, keys []*datastore.Key, dst interf
 		} else {
 			// all found
 			for idx, key := range findInCacheKeys {
-				toCache[cacheKey(key)] = findInCacheVals[idx]
+				toCache[cacheKey(key)] = findInCacheVals.Index(idx).Interface()
 			}
 		}
 
@@ -240,30 +314,23 @@ func (c *Client) GetMulti(ctx context.Context, keys []*datastore.Key, dst interf
 	// find in datastore
 	if len(findInDSKeys) > 0 {
 		cKeys = make([]string, 0)
-		keyErrs := make(map[*datastore.Key]error)
-		if err := c.DSClient.GetMulti(ctx, findInDSKeys, findInDSVals); err != nil {
+		if err := c.DSClient.GetMulti(ctx, findInDSKeys, findInDSVals.Interface()); err != nil {
 			if merr, ok := err.(datastore.MultiError); ok {
 				for idx, key := range findInDSKeys {
 					keyErrs[key] = merr[idx]
 					if merr[idx] == nil || merr[idx] == datastore.ErrNoSuchEntity {
 						cKey := cacheKey(key)
-						toCache[cKey] = findInDSVals[idx]
 						cKeys = append(cKeys, cKey)
+						toCache[cKey] = findInDSVals.Index(idx).Interface()
 					}
 				}
 			}
-		}
-
-		if len(keyErrs) > 0 {
-			merr := make(datastore.MultiError, len(keys))
-			for idx, key := range keys {
-				if err, ok := keyErrs[key]; ok {
-					merr[idx] = err
-				} else {
-					merr[idx] = nil
-				}
+		} else {
+			for idx, key := range findInDSKeys {
+				cKey := cacheKey(key)
+				cKeys = append(cKeys, cKey)
+				toCache[cKey] = findInDSVals.Index(idx).Interface()
 			}
-			return merr
 		}
 
 		if len(toCache) > 0 {
@@ -274,6 +341,29 @@ func (c *Client) GetMulti(ctx context.Context, keys []*datastore.Key, dst interf
 				}
 			}
 		}
+	}
+
+	if len(keyErrs) > 0 {
+
+		// nil dst with errs?
+		for idx, key := range keys {
+			if err, ok := keyErrs[key]; ok && err != nil {
+				elem := vals.Index(idx)
+				if elem.Kind() == reflect.Ptr && !elem.IsNil() {
+					elem.Set(reflect.Zero(elem.Type()))
+				}
+			}
+		}
+
+		merr := make(datastore.MultiError, len(keys))
+		for idx, key := range keys {
+			if err, ok := keyErrs[key]; ok {
+				merr[idx] = err
+			} else {
+				merr[idx] = nil
+			}
+		}
+		return merr
 	}
 
 	return nil
