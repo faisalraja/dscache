@@ -1,4 +1,4 @@
-module github.com/faisalraja/dscache/v1
+module github.com/faisalraja/dscache/v0
 
 go 1.12
 
