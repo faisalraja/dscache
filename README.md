@@ -10,7 +10,7 @@ This is inspired by [Python NDB API](https://developers.google.com/appengine/doc
 
 Other than the Put*, Get* methods, I'll be adding utility functions that helps what I'm using it for.
 
-- `RunQuery` a helper function where you pass a cursor and slice to assign results. This adds KeysOnly() to your passed query and limit to length of slice that you passed.
+- `RunQuery` a helper function where you pass a cursor and slice to assign results. This adds KeysOnly() to your passed query and limit to length of slice that you passed. Then uses GetMulti from query results to fetch data.
 
 ## Usage
 
@@ -48,6 +48,18 @@ func main() {
         // handle error
     }
     // check u.Key, u.Name, u.Email
+
+    // RunQuery sample for viewing users with cursor
+    cursor := ""  // populate from url param
+	users := make([]*User, 20)
+	q := datastore.NewQuery("User")
+    keys, nextCursor, err := client.RunQuery(ctx, q, users, cursor)
+    if err != nil {
+        // handle error
+    }
+    // users is now populated with result of query
+    // if result is less than 20 it will have nil value if it's a slice of pointers or you can use the len(keys)
+    // use nextCursor for next page
 }
 ```
 
