@@ -59,6 +59,17 @@ func (c *Client) putCache(key string, src interface{}) error {
 	return c.putMultiCache(items)
 }
 
+func (c *Client) deleteLocalCache(keys ...string) {
+	c.localCacheLock.Lock()
+	defer c.localCacheLock.Unlock()
+
+	for _, key := range keys {
+		if _, ok := c.localCache[key]; ok {
+			delete(c.localCache, key)
+		}
+	}
+}
+
 func (c *Client) putMultiCache(items map[string]interface{}) error {
 	errc := make(chan error)
 	go func() {
@@ -77,8 +88,6 @@ func (c *Client) putMultiCache(items map[string]interface{}) error {
 	}
 	return nil
 }
-
-// todo transaction
 
 // Run runs the given query in the given context.
 func (c *Client) Run(ctx context.Context, q *datastore.Query) *datastore.Iterator {
@@ -395,21 +404,46 @@ func (c *Client) DeleteMulti(ctx context.Context, keys []*datastore.Key) error {
 	}
 
 	cKeys := make([]string, len(keys))
-	c.localCacheLock.Lock()
-	for _, key := range keys {
-		cKey := cacheKey(key)
-		cKeys = append(cKeys, cKey)
-		if _, ok := c.localCache[cKey]; ok {
-			delete(c.localCache, cKey)
-		}
+	for i, key := range keys {
+		cKeys[i] = cacheKey(key)
 	}
-	c.localCacheLock.Unlock()
 	// Delete data from cache
+	c.deleteLocalCache(cKeys...)
 	if err := c.Cache.Delete(cKeys...); err != nil {
 		log.Printf("dscache.Client.DeleteMulti: failed to delete from cache %v", err)
 	}
 
 	return nil
+}
+
+// RunInTransaction runs a datastore transaction
+func (c *Client) RunInTransaction(ctx context.Context, f func(tx *Transaction) error, opts ...datastore.TransactionOption) error {
+	var txn *Transaction
+
+	_, err := c.DSClient.RunInTransaction(ctx, func(tx *datastore.Transaction) error {
+		txn = &Transaction{
+			txn:       tx,
+			deleteMap: make(map[string]bool),
+		}
+		return f(txn)
+	}, opts...)
+
+	if err == nil {
+		txn.txnLock.Lock()
+		defer txn.txnLock.Unlock()
+		if len(txn.deleteMap) > 0 {
+			var keys []string
+			for key := range txn.deleteMap {
+				keys = append(keys, key)
+			}
+			c.deleteLocalCache(keys...)
+			c.Cache.Delete(keys...)
+		}
+	} else {
+		log.Printf("dscache.Client.RunInTransaction: %v", err)
+	}
+
+	return err
 }
 
 // FlushLocal removes all local cache

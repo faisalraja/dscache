@@ -251,3 +251,65 @@ func TestRunQueryDeleteAll(t *testing.T) {
 
 	client.FlushAll()
 }
+
+func TestRunInTransaction(t *testing.T) {
+	ctx := context.Background()
+	client := NewClient(ctx, testDSClient, testCache)
+
+	type Counter struct {
+		Count int
+	}
+
+	var count int
+	key := datastore.NameKey("Counter", "singleton", nil)
+	c1 := &Counter{}
+	if err := client.Get(ctx, key, c1); err != nil {
+		t.Errorf("Failed get before transaction %v", err)
+	}
+	val1 := c1.Count
+
+	err := client.RunInTransaction(ctx, func(tx *Transaction) error {
+		var x Counter
+		if err := tx.Get(key, &x); err != nil && err != datastore.ErrNoSuchEntity {
+			return err
+		}
+		x.Count++
+		if _, err := tx.Put(key, &x); err != nil {
+			return err
+		}
+		count = x.Count
+		return nil
+	})
+
+	if err != nil {
+		t.Errorf("Transaction failed: %v", err)
+	}
+
+	if err := client.Get(ctx, key, c1); err != nil {
+		t.Errorf("Failed get after transaction %v", err)
+	}
+
+	if val1 == c1.Count {
+		t.Errorf("Local cache failed to delete after transaction")
+	}
+
+	client.FlushLocal()
+
+	if err := client.Get(ctx, key, c1); err != nil {
+		t.Errorf("Failed get after transaction %v", err)
+	}
+
+	if val1 == c1.Count {
+		t.Errorf("Redis cache failed to delete after transaction")
+	}
+
+	client.FlushAll()
+
+	if err := client.Get(ctx, key, c1); err != nil {
+		t.Errorf("Failed get after transaction %v", err)
+	}
+
+	if count != c1.Count {
+		t.Errorf("Datastore count not match %d != %d", count, c1.Count)
+	}
+}

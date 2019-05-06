@@ -2,7 +2,7 @@
 
 `This is still under heavy development and is being used in a new product that is not yet released.`
 
-Package `github.com/faisalraja/dscache/v0` is a wrapper for [golang datastore client](https://godoc.org/cloud.google.com/go/datastore) that uses redis to cache Get,GetMulti,Put,PutMulti with strong consistency.
+Package `github.com/faisalraja/dscache/v0` is a wrapper for [golang datastore client](https://godoc.org/cloud.google.com/go/datastore) that uses redis to cache Get*,Put*,Delete\* with strong consistency.
 
 This is inspired by [Python NDB API](https://developers.google.com/appengine/docs/python/ndb/) where it caches to local memory then redis.
 
@@ -14,7 +14,7 @@ Other than the Put*, Get* methods, I'll be adding utility functions that helps w
 
 ## Usage
 
-I recommend instanciating your datastore client and cache pool globally then create a dsclient.NewClient() per request.
+I recommend instanciating your datastore client and cache pool globally then create a dsclient.NewClient() per request. It is important to only use this package for doing Get*,Put*,Delete\* and RunInTransaction and not mix with the regular datastore client.
 
 ```go
 func main() {
@@ -60,6 +60,19 @@ func main() {
     // users is now populated with result of query
     // if result is less than 20 it will have nil value if it's a slice of pointers or you can use the len(keys)
     // use nextCursor for next page
+
+    // Transaction sample
+	client.RunInTransaction(ctx, func(tx *dscache.Transaction) error {
+		var u User
+		if err := tx.Get(key, &u); err != nil && err != datastore.ErrNoSuchEntity {
+			return err
+		}
+		u.Name = "New Name"
+		if _, err := tx.Put(key, &u); err != nil {
+			return err
+		}
+		return nil
+	})
 }
 ```
 
