@@ -313,3 +313,86 @@ func TestRunInTransaction(t *testing.T) {
 		t.Errorf("Datastore count not match %d != %d", count, c1.Count)
 	}
 }
+
+func TestNestedStruct(t *testing.T) {
+	ctx := context.Background()
+	client := NewClient(ctx, testDSClient, testCache)
+
+	type Inner1 struct {
+		W int32
+		X string
+	}
+
+	type Inner2 struct {
+		Y float64
+	}
+
+	type Inner3 struct {
+		Z bool
+	}
+
+	type Inner4 struct {
+		WW int
+	}
+
+	type Inner5 struct {
+		X Inner4
+	}
+
+	type Outer struct {
+		A      int16
+		I      []Inner1 `datastore:",flatten"`
+		J      Inner2   `datastore:",flatten"`
+		K      Inner5   `datastore:",flatten"`
+		Inner3 `datastore:",flatten"`
+	}
+
+	key := datastore.IDKey("Outer", 0, nil)
+	o := &Outer{
+		A: 10,
+		I: []Inner1{
+			Inner1{W: 10, X: "Ten"},
+			Inner1{W: 15, X: "Fifteen"},
+		},
+		J: Inner2{Y: 12.3},
+		K: Inner5{X: Inner4{WW: 25}},
+	}
+	key, err := client.Put(ctx, key, o)
+	if err != nil {
+		t.Errorf("Failed to put nested struct: %v", key)
+	}
+
+	oLocal := &Outer{}
+	if err := client.Get(ctx, key, oLocal); err != nil {
+		t.Errorf("Nested struct get failed: %v", err)
+	}
+	if !reflect.DeepEqual(o, oLocal) {
+		t.Errorf("Nested struct local not match: %v != %v", o, oLocal)
+	}
+
+	client.FlushLocal()
+
+	oCache := &Outer{}
+	if err := client.Get(ctx, key, oCache); err != nil {
+		t.Errorf("Nested struct get failed redis: %v", err)
+	}
+	if !reflect.DeepEqual(o, oCache) {
+		t.Errorf("Nested struct redis not match: %v != %v", o, oCache)
+	}
+
+	client.FlushAll()
+
+	o2 := &Outer{}
+	if err := client.Get(ctx, key, o2); err != nil {
+		t.Errorf("Nested struct get failed redis: %v", err)
+	}
+	if !reflect.DeepEqual(o, o2) {
+		t.Errorf("Nested struct datastore not match: %v != %v", o, o2)
+	}
+	if !reflect.DeepEqual(o2, oLocal) {
+		t.Errorf("Nested struct datastore not match: %v != %v", o, oLocal)
+	}
+	if !reflect.DeepEqual(o2, oCache) {
+		t.Errorf("Nested struct datastore not match: %v != %v", o, oCache)
+	}
+}
