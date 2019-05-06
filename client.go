@@ -235,7 +235,6 @@ func (c *Client) Get(ctx context.Context, key *datastore.Key, dst interface{}) e
 }
 
 // GetMulti is batch version of Get
-// todo support []T since cache.GetMulti doesn't
 func (c *Client) GetMulti(ctx context.Context, keys []*datastore.Key, dst interface{}) error {
 	vals := reflect.ValueOf(dst)
 
@@ -384,37 +383,22 @@ func (c *Client) GetMulti(ctx context.Context, keys []*datastore.Key, dst interf
 	return nil
 }
 
-// Delete removes from cache then datastore
+// Delete removes from datastore then cache
 func (c *Client) Delete(ctx context.Context, key *datastore.Key) error {
-	cKey := cacheKey(key)
-
-	if err := c.DSClient.Delete(ctx, key); err != nil {
-		return fmt.Errorf("dscache.Client.Delete: failed to delete %v", err)
-	}
-
-	c.localCacheLock.Lock()
-	if _, ok := c.localCache[cKey]; ok {
-		delete(c.localCache, cKey)
-	}
-	c.localCacheLock.Unlock()
-
-	if err := c.Cache.Delete(cKey); err != nil {
-		log.Printf("dscache.Client.Delete: failed to delete from cache err: %v", err)
-	}
-
-	return nil
+	return c.DeleteMulti(ctx, []*datastore.Key{key})
 }
 
 // DeleteMulti batch version of Delete
 func (c *Client) DeleteMulti(ctx context.Context, keys []*datastore.Key) error {
-	cKeys := make([]string, len(keys))
-
 	if err := c.DSClient.DeleteMulti(ctx, keys); err != nil {
 		return fmt.Errorf("dscache.Client.DeleteMulti: failed to delete %v", err)
 	}
 
+	cKeys := make([]string, len(keys))
 	c.localCacheLock.Lock()
-	for _, cKey := range cKeys {
+	for _, key := range keys {
+		cKey := cacheKey(key)
+		cKeys = append(cKeys, cKey)
 		if _, ok := c.localCache[cKey]; ok {
 			delete(c.localCache, cKey)
 		}

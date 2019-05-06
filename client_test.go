@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"cloud.google.com/go/datastore"
+	"github.com/garyburd/redigo/redis"
 )
 
 // Run datastore emulator and redis then set these environment variables
@@ -202,10 +203,44 @@ func TestRunQueryDeleteAll(t *testing.T) {
 		if err != nil {
 			t.Errorf("Failed to run query %v", err)
 		}
-
 		if len(keys) > 0 {
 			if err := client.DeleteMulti(ctx, keys); err != nil {
 				t.Errorf("Failed to delete keys: %v", len(keys))
+			}
+			// test not exists
+			cKeys := make([]string, len(keys))
+			for i, key := range keys {
+				cKey := cacheKey(key)
+				cKeys[i] = cKey
+				if _, ok := client.localCache[cKey]; ok {
+					t.Errorf("Found %v in local cache", key)
+				}
+
+				if _, err := client.Cache.Get(cKey); err != redis.ErrNil {
+					t.Errorf("Found %v in redis cache", key)
+				}
+			}
+
+			_, err := client.Cache.GetMulti(cKeys...)
+			merr, ok := err.(MultiError)
+			if !ok {
+				t.Errorf("Found cache in deleted keys: %v", cKeys)
+			}
+			if merr.Count() != len(cKeys) {
+				t.Errorf("Error count must match with lentgh of keys: %v != %v", merr.Count(), len(cKeys))
+			}
+
+			out = make([]*TestA, len(keys))
+			client.FlushAll()
+			err = client.GetMulti(ctx, keys, out)
+			if err != nil {
+				t.Errorf("Since GetMulti ignores not found it shouldn't have an error: %v", err)
+			}
+			// Make sure out is all nil stil
+			for _, v := range out {
+				if v != nil {
+					t.Errorf("Value is not nil: %v", v)
+				}
 			}
 		}
 

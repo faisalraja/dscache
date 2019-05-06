@@ -99,7 +99,7 @@ func (c *Cache) Get(key string) ([]byte, error) {
 
 	data, err := redis.Bytes(conn.Do("GET", key))
 	if err != nil {
-		return nil, fmt.Errorf("dscache.Cache.Get: failed %v", err)
+		return nil, err
 	}
 	return data, nil
 }
